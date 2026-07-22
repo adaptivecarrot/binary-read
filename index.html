@@ -324,7 +324,7 @@
         <div class="stat-card"><span class="stat-value" id="bestStreakStat">0</span><span class="stat-label">best streak</span></div>
         <div class="stat-card"><span class="stat-value" id="seenStat">0</span><span class="stat-label">patterns seen</span></div>
         <div class="stat-card"><span class="stat-value" id="streakStat">0</span><span class="stat-label">current streak</span></div>
-        <div class="stat-card"><span class="stat-value" id="masteredStat">0</span><span class="stat-label">patterns mastered</span></div>
+        <div class="stat-card"><span class="stat-value" id="dueStat">0</span><span class="stat-label">due now</span></div>
       </div>
       <div class="modal-actions">
         <button class="text-button" id="downloadButton" type="button">Download complete CSV</button>
@@ -348,22 +348,115 @@
     (() => {
       'use strict';
 
-      const STORAGE_KEY = 'binaryDotsTrainer.v2';
-      const LEGACY_STORAGE_KEY = 'binaryDotsTrainer.v1';
+      const STORAGE_KEY = 'binaryDotsTrainer.v4';
+      const DAY_MS = 24 * 60 * 60 * 1000;
+      const DESIRED_RETENTION = 0.90;
+      const FSRS_VERSION = 'FSRS-6';
+      const FSRS_WEIGHTS = [0.212, 1.2931, 2.3065, 8.2956, 6.4133, 0.8334, 3.0194, 0.001, 1.8722, 0.1666, 0.796, 1.4835, 0.0614, 0.2629, 1.6483, 0.6014, 1.8729, 0.5425, 0.0912, 0.0658, 0.1542];
+      const RATING_AGAIN = 1;
+      const RATING_GOOD = 3;
+      const createCard = cardId => ({
+        cardId,
+        difficulty: null,
+        stability: null,
+        retrievability: null,
+        lastReview: null,
+        nextReview: null,
+        reviewCount: 0,
+        lastRating: null
+      });
       const freshState = () => ({
-        version: 2,
+        version: 4,
         theme: 'light',
         sessions: [],
         questions: [],
+        cards: Array.from({ length: 64 }, (_, cardId) => createCard(cardId)),
         nextSequence: 1,
         game: {
-          deck: [],
-          review: [],
-          questionsSinceReview: 0,
           lastValue: null,
           currentQuestionId: null
         }
       });
+
+      function clamp(value, minimum, maximum) {
+        return Math.min(maximum, Math.max(minimum, value));
+      }
+
+      function initialDifficulty(rating) {
+        return clamp(FSRS_WEIGHTS[4] - Math.exp(FSRS_WEIGHTS[5] * (rating - 1)) + 1, 1, 10);
+      }
+
+      function nextDifficulty(difficulty, rating) {
+        const delta = -FSRS_WEIGHTS[6] * (rating - 3);
+        const damped = difficulty + delta * (10 - difficulty) / 9;
+        const easyTarget = initialDifficulty(4);
+        return clamp(FSRS_WEIGHTS[7] * easyTarget + (1 - FSRS_WEIGHTS[7]) * damped, 1, 10);
+      }
+
+      function retrievability(stability, elapsedDays) {
+        if (!stability || elapsedDays <= 0) return 1;
+        const decay = FSRS_WEIGHTS[20];
+        const factor = Math.pow(0.9, -1 / decay) - 1;
+        return Math.pow(1 + factor * elapsedDays / stability, -decay);
+      }
+
+      function nextRecallStability(difficulty, stability, recall) {
+        return stability * (
+          1 + Math.exp(FSRS_WEIGHTS[8]) * (11 - difficulty) * Math.pow(stability, -FSRS_WEIGHTS[9])
+          * (Math.exp(FSRS_WEIGHTS[10] * (1 - recall)) - 1)
+        );
+      }
+
+      function nextForgetStability(difficulty, stability, recall) {
+        return FSRS_WEIGHTS[11] * Math.pow(difficulty, -FSRS_WEIGHTS[12])
+          * (Math.pow(stability + 1, FSRS_WEIGHTS[13]) - 1)
+          * Math.exp(FSRS_WEIGHTS[14] * (1 - recall));
+      }
+
+      function nextSameDayStability(stability, rating) {
+        const next = stability * Math.exp(FSRS_WEIGHTS[17] * (rating - 3 + FSRS_WEIGHTS[18])) * Math.pow(stability, -FSRS_WEIGHTS[19]);
+        return rating >= 3 ? Math.max(stability, next) : next;
+      }
+
+      function intervalForStability(stability) {
+        const decay = FSRS_WEIGHTS[20];
+        const factor = Math.pow(0.9, -1 / decay) - 1;
+        return Math.max(1 / 1440, stability / factor * (Math.pow(DESIRED_RETENTION, -1 / decay) - 1));
+      }
+
+      function reviewCard(card, result, now) {
+        const rating = result ? RATING_GOOD : RATING_AGAIN;
+        const firstReview = card.reviewCount === 0 || card.stability === null || card.lastReview === null;
+        const elapsedDays = firstReview ? 0 : Math.max(0, (now - card.lastReview) / DAY_MS);
+        const recallBefore = firstReview ? 1 : retrievability(card.stability, elapsedDays);
+        const difficulty = firstReview ? initialDifficulty(rating) : nextDifficulty(card.difficulty, rating);
+        let stability;
+        if (firstReview) {
+          stability = FSRS_WEIGHTS[rating - 1];
+        } else {
+          const lastDate = new Date(card.lastReview);
+          const reviewDate = new Date(now);
+          const sameLocalDay = lastDate.getFullYear() === reviewDate.getFullYear()
+            && lastDate.getMonth() === reviewDate.getMonth()
+            && lastDate.getDate() === reviewDate.getDate();
+          if (sameLocalDay) stability = nextSameDayStability(card.stability, rating);
+          else if (rating === RATING_AGAIN) stability = nextForgetStability(card.difficulty, card.stability, recallBefore);
+          else stability = nextRecallStability(card.difficulty, card.stability, recallBefore);
+        }
+        stability = Math.max(1 / 1440, stability);
+        const intervalDays = intervalForStability(stability);
+        const updated = {
+          cardId: card.cardId,
+          difficulty,
+          stability,
+          retrievability: 1,
+          lastReview: now,
+          nextReview: now + intervalDays * DAY_MS,
+          reviewCount: card.reviewCount + 1,
+          lastRating: rating === RATING_GOOD ? 'Good' : 'Again'
+        };
+        return { rating: updated.lastRating, elapsedDays, retrievabilityBefore: recallBefore, intervalDays, updated };
+      }
 
       function makeId() {
         if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') return globalThis.crypto.randomUUID();
@@ -372,10 +465,11 @@
 
       function loadState() {
         try {
-          localStorage.removeItem(LEGACY_STORAGE_KEY);
           const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-          if (!saved || saved.version !== 2 || !Array.isArray(saved.sessions) || !Array.isArray(saved.questions)) return freshState();
-          return { ...freshState(), ...saved, game: { ...freshState().game, ...saved.game } };
+          if (saved && saved.version === 4 && Array.isArray(saved.sessions) && Array.isArray(saved.questions) && Array.isArray(saved.cards) && saved.cards.length === 64) {
+            return { ...freshState(), ...saved, game: { ...freshState().game, ...saved.game } };
+          }
+          return freshState();
         } catch (_) {
           return freshState();
         }
@@ -408,7 +502,9 @@
       }
 
       function saveState() {
-        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (_) { /* Storage may be unavailable in private mode. */ }
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        } catch (_) { /* Storage may be unavailable in private mode. */ }
       }
 
       function beginSession() {
@@ -428,75 +524,39 @@
         return state.questions.filter(question => question.status === 'answered');
       }
 
-      function getPatternStats(value) {
-        const attempts = answeredQuestions().filter(question => question.correctAnswer === value);
-        const correct = attempts.filter(question => question.isCorrect);
-        return {
-          attempts: attempts.length,
-          correct: correct.length,
-          mistakes: attempts.length - correct.length,
-          totalCorrectMs: correct.reduce((sum, question) => sum + question.responseMs, 0)
-        };
-      }
-
-      function shuffle(values) {
-        const copy = values.slice();
-        for (let i = copy.length - 1; i > 0; i -= 1) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [copy[i], copy[j]] = [copy[j], copy[i]];
-        }
-        return copy;
-      }
-
-      function isMastered(pattern) {
-        return pattern.correct >= 2 && pattern.totalCorrectMs / pattern.correct <= 3000;
-      }
-
-      function refillDeck() {
-        const priority = [];
-        const mastered = [];
-        for (let value = 0; value < 64; value += 1) {
-          (isMastered(getPatternStats(value)) ? mastered : priority).push(value);
-        }
-        state.game.deck = shuffle(priority).concat(shuffle(mastered));
-      }
-
-      function weightedChoice() {
-        const candidates = Array.from({ length: 64 }, (_, value) => {
-          const pattern = getPatternStats(value);
-          const average = pattern.correct ? pattern.totalCorrectMs / pattern.correct : 6000;
-          const errorRate = pattern.attempts ? pattern.mistakes / pattern.attempts : 1;
-          const weight = 1 + errorRate * 5 + Math.max(0, average - 2500) / 1000 + (pattern.attempts === 0 ? 5 : 0);
-          return { value, weight: value === state.game.lastValue ? weight * 0.15 : weight };
-        });
-        let roll = Math.random() * candidates.reduce((sum, item) => sum + item.weight, 0);
-        for (const item of candidates) {
-          roll -= item.weight;
-          if (roll <= 0) return item.value;
-        }
-        return candidates[candidates.length - 1].value;
-      }
-
-      function chooseNext() {
-        let value;
-        let source;
+      function chooseNext(now = Date.now()) {
         const previousValue = state.game.lastValue;
-        if (state.game.review.length && state.game.questionsSinceReview >= 2) {
-          value = state.game.review.shift();
-          state.game.questionsSinceReview = 0;
-          source = 'review';
+        const due = state.cards
+          .filter(card => card.reviewCount > 0 && card.nextReview <= now)
+          .sort((a, b) => a.nextReview - b.nextReview);
+        const fresh = state.cards.filter(card => card.reviewCount === 0);
+        let candidates;
+        let source;
+        if (due.length) {
+          candidates = due;
+          source = 'fsrs-due';
+        } else if (fresh.length) {
+          candidates = fresh;
+          source = 'fsrs-new';
         } else {
-          if (!state.game.deck.length) refillDeck();
-          value = state.game.deck.shift();
-          state.game.questionsSinceReview += 1;
-          source = 'deck';
+          candidates = state.cards.slice().sort((a, b) => a.nextReview - b.nextReview);
+          source = 'fsrs-earliest';
         }
-        if (value === state.game.lastValue) {
-          value = weightedChoice();
-          source = 'weighted-choice';
-        }
-        state.game.lastValue = value;
-        return { value, source, previousValue };
+        const withoutRepeat = candidates.filter(card => card.cardId !== previousValue);
+        if (withoutRepeat.length) candidates = withoutRepeat;
+        const card = source === 'fsrs-new'
+          ? candidates[Math.floor(Math.random() * candidates.length)]
+          : candidates[0];
+        state.game.lastValue = card.cardId;
+        const elapsedDays = card.lastReview === null ? 0 : Math.max(0, (now - card.lastReview) / DAY_MS);
+        return {
+          value: card.cardId,
+          source,
+          previousValue,
+          dueAt: card.nextReview,
+          retrievabilityAtSelection: card.stability === null ? null : retrievability(card.stability, elapsedDays),
+          cardState: { ...card }
+        };
       }
 
       function renderDots(value) {
@@ -522,13 +582,13 @@
         answerInput.inputMode = mobileKeypad.matches ? 'none' : 'numeric';
       }
 
-      function startQuestion() {
+      function startQuestion(feedback = null) {
         const selection = chooseNext();
         currentValue = selection.value;
         answer = '';
         answered = false;
-        message.textContent = '';
-        message.className = 'message';
+        message.textContent = feedback ? feedback.text : '';
+        message.className = feedback ? feedback.className : 'message';
         nextButton.classList.remove('visible');
         setKeypadDisabled(false);
         answerInput.disabled = false;
@@ -555,11 +615,20 @@
           responseMs: null,
           streakBefore: calculateSummary().currentStreak,
           streakAfter: null,
-          queuedForReview: false,
-          deckAfterSelection: state.game.deck.slice(),
-          reviewAfterSelection: state.game.review.slice(),
-          questionsSinceReviewAfterSelection: state.game.questionsSinceReview,
-          reviewAfterAnswer: null
+          fsrsVersion: FSRS_VERSION,
+          desiredRetention: DESIRED_RETENTION,
+          fsrsDueAtSelection: selection.dueAt,
+          fsrsRetrievabilityAtSelection: selection.retrievabilityAtSelection,
+          fsrsDifficultyBefore: selection.cardState.difficulty,
+          fsrsStabilityBeforeDays: selection.cardState.stability,
+          fsrsReviewCountBefore: selection.cardState.reviewCount,
+          fsrsRating: null,
+          fsrsElapsedDays: null,
+          fsrsRetrievabilityBeforeReview: null,
+          fsrsDifficultyAfter: null,
+          fsrsStabilityAfterDays: null,
+          fsrsIntervalDays: null,
+          fsrsNextReview: null
         };
         state.nextSequence += 1;
         state.questions.push(currentQuestion);
@@ -585,10 +654,6 @@
         if (!mobileKeypad.matches) answerInput.focus({ preventScroll: true });
       }
 
-      function addReview(value) {
-        if (!state.game.review.includes(value)) state.game.review.push(value);
-      }
-
       function submitAnswer() {
         if (answered || answer === '' || !currentQuestion) return;
         const answeredAt = Date.now();
@@ -604,31 +669,25 @@
         currentQuestion.answeredAt = answeredAt;
         currentQuestion.responseMs = elapsed;
         currentQuestion.streakAfter = correct ? currentQuestion.streakBefore + 1 : 0;
+        const fsrsReview = reviewCard(state.cards[currentValue], correct, answeredAt);
+        state.cards[currentValue] = fsrsReview.updated;
+        currentQuestion.fsrsRating = fsrsReview.rating;
+        currentQuestion.fsrsElapsedDays = fsrsReview.elapsedDays;
+        currentQuestion.fsrsRetrievabilityBeforeReview = fsrsReview.retrievabilityBefore;
+        currentQuestion.fsrsDifficultyAfter = fsrsReview.updated.difficulty;
+        currentQuestion.fsrsStabilityAfterDays = fsrsReview.updated.stability;
+        currentQuestion.fsrsIntervalDays = fsrsReview.intervalDays;
+        currentQuestion.fsrsNextReview = fsrsReview.updated.nextReview;
 
-        if (correct) {
-          message.textContent = `Correct — ${(elapsed / 1000).toFixed(2)} seconds.`;
-          message.className = 'message correct';
-          if (elapsed > 3500) {
-            addReview(currentValue);
-            currentQuestion.queuedForReview = true;
-          }
-        } else {
-          message.textContent = `Not quite. The answer is ${currentValue} (${currentValue.toString(2).padStart(6, '0')}).`;
-          message.className = 'message incorrect';
-          addReview(currentValue);
-          currentQuestion.queuedForReview = true;
-        }
+        const feedback = correct
+          ? { text: `Previous: correct — ${(elapsed / 1000).toFixed(2)} seconds.`, className: 'message correct' }
+          : { text: `Previous: not quite. The answer was ${currentValue} (${currentValue.toString(2).padStart(6, '0')}).`, className: 'message incorrect' };
 
-        currentQuestion.reviewAfterAnswer = state.game.review.slice();
         state.game.currentQuestionId = null;
         touchSession();
-
-        setKeypadDisabled(true);
-        answerInput.disabled = true;
-        nextButton.classList.add('visible');
         updateStats();
         saveState();
-        nextButton.focus({ preventScroll: true });
+        startQuestion(feedback);
       }
 
       function calculateSummary() {
@@ -641,10 +700,7 @@
           currentStreak = question.isCorrect ? currentStreak + 1 : 0;
           bestStreak = Math.max(bestStreak, currentStreak);
         });
-        let mastered = 0;
-        for (let value = 0; value < 64; value += 1) {
-          if (isMastered(getPatternStats(value))) mastered += 1;
-        }
+        const due = state.cards.filter(card => card.reviewCount > 0 && card.nextReview <= Date.now()).length;
         return {
           attempts: attempts.length,
           correct,
@@ -654,7 +710,7 @@
           patternsSeen: new Set(attempts.map(question => question.correctAnswer)).size,
           currentStreak,
           bestStreak,
-          mastered
+          due
         };
       }
 
@@ -669,7 +725,7 @@
         document.getElementById('bestStreakStat').textContent = String(summary.bestStreak);
         document.getElementById('seenStat').textContent = String(summary.patternsSeen);
         document.getElementById('streakStat').textContent = String(summary.currentStreak);
-        document.getElementById('masteredStat').textContent = String(summary.mastered);
+        document.getElementById('dueStat').textContent = String(summary.due);
       }
 
       function enterDigit(digit) {
@@ -717,23 +773,27 @@
         saveState();
         const exportedAt = Date.now();
         const columns = [
-          'record_type', 'schema_version', 'exported_at_utc', 'theme',
+          'record_type', 'schema_version', 'exported_at_utc', 'theme', 'scheduler_version',
+          'desired_retention', 'fsrs_weights',
           'session_id', 'answered_session_id', 'session_started_at_utc', 'session_last_active_at_utc',
           'question_id', 'global_sequence', 'session_sequence', 'status', 'selection_source',
           'previous_value', 'binary_pattern', 'correct_answer', 'entered_answer', 'is_correct',
           'shown_at_utc', 'answered_at_utc', 'response_ms', 'streak_before', 'streak_after',
-          'queued_for_review', 'deck_after_selection', 'review_after_selection',
-          'questions_since_review_after_selection', 'review_after_answer',
-          'current_question_id', 'current_deck', 'current_review',
-          'current_questions_since_review', 'current_last_value'
+          'card_id', 'fsrs_rating', 'fsrs_due_at_selection_utc', 'fsrs_elapsed_days',
+          'fsrs_retrievability_at_selection', 'fsrs_retrievability_before_review',
+          'fsrs_difficulty_before', 'fsrs_difficulty_after',
+          'fsrs_stability_before_days', 'fsrs_stability_after_days',
+          'fsrs_review_count_before', 'fsrs_interval_days', 'fsrs_next_review_utc',
+          'card_difficulty', 'card_stability_days', 'card_retrievability_at_export',
+          'card_last_review_utc', 'card_next_review_utc', 'card_review_count', 'card_last_rating',
+          'current_question_id', 'current_last_value'
         ];
         const rows = [];
         const metadata = {
           record_type: 'metadata', schema_version: state.version, exported_at_utc: toIso(exportedAt), theme: state.theme,
+          scheduler_version: FSRS_VERSION, desired_retention: DESIRED_RETENTION,
+          fsrs_weights: JSON.stringify(FSRS_WEIGHTS),
           current_question_id: state.game.currentQuestionId,
-          current_deck: JSON.stringify(state.game.deck),
-          current_review: JSON.stringify(state.game.review),
-          current_questions_since_review: state.game.questionsSinceReview,
           current_last_value: state.game.lastValue
         };
         rows.push(metadata);
@@ -745,6 +805,7 @@
         }));
         state.questions.forEach(question => rows.push({
           record_type: 'question', schema_version: state.version, exported_at_utc: toIso(exportedAt),
+          scheduler_version: question.fsrsVersion, desired_retention: question.desiredRetention,
           session_id: question.sessionId, answered_session_id: question.answeredSessionId,
           question_id: question.questionId,
           global_sequence: question.sequence, session_sequence: question.sessionSequence,
@@ -754,12 +815,31 @@
           is_correct: question.isCorrect, shown_at_utc: toIso(question.shownAt),
           answered_at_utc: toIso(question.answeredAt), response_ms: question.responseMs,
           streak_before: question.streakBefore, streak_after: question.streakAfter,
-          queued_for_review: question.queuedForReview,
-          deck_after_selection: JSON.stringify(question.deckAfterSelection),
-          review_after_selection: JSON.stringify(question.reviewAfterSelection),
-          questions_since_review_after_selection: question.questionsSinceReviewAfterSelection,
-          review_after_answer: question.reviewAfterAnswer === null ? '' : JSON.stringify(question.reviewAfterAnswer)
+          card_id: question.correctAnswer, fsrs_rating: question.fsrsRating,
+          fsrs_due_at_selection_utc: toIso(question.fsrsDueAtSelection),
+          fsrs_elapsed_days: question.fsrsElapsedDays,
+          fsrs_retrievability_at_selection: question.fsrsRetrievabilityAtSelection,
+          fsrs_retrievability_before_review: question.fsrsRetrievabilityBeforeReview,
+          fsrs_difficulty_before: question.fsrsDifficultyBefore,
+          fsrs_difficulty_after: question.fsrsDifficultyAfter,
+          fsrs_stability_before_days: question.fsrsStabilityBeforeDays,
+          fsrs_stability_after_days: question.fsrsStabilityAfterDays,
+          fsrs_review_count_before: question.fsrsReviewCountBefore,
+          fsrs_interval_days: question.fsrsIntervalDays,
+          fsrs_next_review_utc: toIso(question.fsrsNextReview)
         }));
+        state.cards.forEach(card => {
+          const elapsedDays = card.lastReview === null ? 0 : Math.max(0, (exportedAt - card.lastReview) / DAY_MS);
+          rows.push({
+            record_type: 'card', schema_version: state.version, exported_at_utc: toIso(exportedAt),
+            scheduler_version: FSRS_VERSION, desired_retention: DESIRED_RETENTION,
+            card_id: card.cardId, card_difficulty: card.difficulty,
+            card_stability_days: card.stability,
+            card_retrievability_at_export: card.stability === null ? '' : retrievability(card.stability, elapsedDays),
+            card_last_review_utc: toIso(card.lastReview), card_next_review_utc: toIso(card.nextReview),
+            card_review_count: card.reviewCount, card_last_rating: card.lastRating
+          });
+        });
         const csv = [columns.map(csvCell).join(','), ...rows.map(row => columns.map(column => csvCell(row[column])).join(','))].join('\r\n');
         const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' });
         const url = URL.createObjectURL(blob);
