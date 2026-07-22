@@ -348,7 +348,7 @@
     (() => {
       'use strict';
 
-      const STORAGE_KEY = 'binaryDotsTrainer.v4';
+      const STORAGE_KEY = 'binaryDotsTrainer.v5';
       const DAY_MS = 24 * 60 * 60 * 1000;
       const DESIRED_RETENTION = 0.90;
       const FSRS_VERSION = 'FSRS-6';
@@ -366,7 +366,7 @@
         lastRating: null
       });
       const freshState = () => ({
-        version: 4,
+        version: 5,
         theme: 'light',
         sessions: [],
         questions: [],
@@ -466,7 +466,7 @@
       function loadState() {
         try {
           const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-          if (saved && saved.version === 4 && Array.isArray(saved.sessions) && Array.isArray(saved.questions) && Array.isArray(saved.cards) && saved.cards.length === 64) {
+          if (saved && saved.version === 5 && Array.isArray(saved.sessions) && Array.isArray(saved.questions) && Array.isArray(saved.cards) && saved.cards.length === 64) {
             return { ...freshState(), ...saved, game: { ...freshState().game, ...saved.game } };
           }
           return freshState();
@@ -582,13 +582,13 @@
         answerInput.inputMode = mobileKeypad.matches ? 'none' : 'numeric';
       }
 
-      function startQuestion(feedback = null) {
+      function startQuestion() {
         const selection = chooseNext();
         currentValue = selection.value;
         answer = '';
         answered = false;
-        message.textContent = feedback ? feedback.text : '';
-        message.className = feedback ? feedback.className : 'message';
+        message.textContent = '';
+        message.className = 'message';
         nextButton.classList.remove('visible');
         setKeypadDisabled(false);
         answerInput.disabled = false;
@@ -612,7 +612,9 @@
           isCorrect: null,
           shownAt,
           answeredAt: null,
+          acknowledgedAt: null,
           responseMs: null,
+          transitionMs: null,
           streakBefore: calculateSummary().currentStreak,
           streakAfter: null,
           fsrsVersion: FSRS_VERSION,
@@ -654,6 +656,33 @@
         if (!mobileKeypad.matches) answerInput.focus({ preventScroll: true });
       }
 
+      function restoreAnsweredQuestion(question) {
+        currentQuestion = question;
+        currentValue = question.correctAnswer;
+        answer = question.enteredAnswer || '';
+        answered = true;
+        message.textContent = question.isCorrect
+          ? `Correct — ${(question.responseMs / 1000).toFixed(2)} seconds.`
+          : `Not quite. The answer is ${question.correctAnswer} (${question.binaryPattern}).`;
+        message.className = question.isCorrect ? 'message correct' : 'message incorrect';
+        setKeypadDisabled(true);
+        answerInput.disabled = true;
+        updateAnswer();
+        renderDots(currentValue);
+        nextButton.classList.add('visible');
+        nextButton.focus({ preventScroll: true });
+      }
+
+      function advanceQuestion() {
+        if (!answered || !currentQuestion || currentQuestion.status !== 'answered') return;
+        currentQuestion.acknowledgedAt = Date.now();
+        currentQuestion.transitionMs = Math.max(0, currentQuestion.acknowledgedAt - currentQuestion.answeredAt);
+        state.game.currentQuestionId = null;
+        touchSession();
+        saveState();
+        startQuestion();
+      }
+
       function submitAnswer() {
         if (answered || answer === '' || !currentQuestion) return;
         const answeredAt = Date.now();
@@ -679,15 +708,17 @@
         currentQuestion.fsrsIntervalDays = fsrsReview.intervalDays;
         currentQuestion.fsrsNextReview = fsrsReview.updated.nextReview;
 
-        const feedback = correct
-          ? { text: `Previous: correct — ${(elapsed / 1000).toFixed(2)} seconds.`, className: 'message correct' }
-          : { text: `Previous: not quite. The answer was ${currentValue} (${currentValue.toString(2).padStart(6, '0')}).`, className: 'message incorrect' };
-
-        state.game.currentQuestionId = null;
+        message.textContent = correct
+          ? `Correct — ${(elapsed / 1000).toFixed(2)} seconds.`
+          : `Not quite. The answer is ${currentValue} (${currentValue.toString(2).padStart(6, '0')}).`;
+        message.className = correct ? 'message correct' : 'message incorrect';
+        setKeypadDisabled(true);
+        answerInput.disabled = true;
+        nextButton.classList.add('visible');
         touchSession();
         updateStats();
         saveState();
-        startQuestion(feedback);
+        nextButton.focus({ preventScroll: true });
       }
 
       function calculateSummary() {
@@ -778,7 +809,8 @@
           'session_id', 'answered_session_id', 'session_started_at_utc', 'session_last_active_at_utc',
           'question_id', 'global_sequence', 'session_sequence', 'status', 'selection_source',
           'previous_value', 'binary_pattern', 'correct_answer', 'entered_answer', 'is_correct',
-          'shown_at_utc', 'answered_at_utc', 'response_ms', 'streak_before', 'streak_after',
+          'shown_at_utc', 'answered_at_utc', 'acknowledged_at_utc', 'response_ms', 'transition_ms',
+          'streak_before', 'streak_after',
           'card_id', 'fsrs_rating', 'fsrs_due_at_selection_utc', 'fsrs_elapsed_days',
           'fsrs_retrievability_at_selection', 'fsrs_retrievability_before_review',
           'fsrs_difficulty_before', 'fsrs_difficulty_after',
@@ -813,7 +845,8 @@
           previous_value: question.previousValue, binary_pattern: question.binaryPattern,
           correct_answer: question.correctAnswer, entered_answer: question.enteredAnswer,
           is_correct: question.isCorrect, shown_at_utc: toIso(question.shownAt),
-          answered_at_utc: toIso(question.answeredAt), response_ms: question.responseMs,
+          answered_at_utc: toIso(question.answeredAt), acknowledged_at_utc: toIso(question.acknowledgedAt),
+          response_ms: question.responseMs, transition_ms: question.transitionMs,
           streak_before: question.streakBefore, streak_after: question.streakAfter,
           card_id: question.correctAnswer, fsrs_rating: question.fsrsRating,
           fsrs_due_at_selection_utc: toIso(question.fsrsDueAtSelection),
@@ -905,7 +938,7 @@
         }
       });
       document.getElementById('submitButton').addEventListener('click', submitAnswer);
-      nextButton.addEventListener('click', startQuestion);
+      nextButton.addEventListener('click', advanceQuestion);
       themeToggle.addEventListener('click', () => applyTheme(state.theme === 'dark' ? 'light' : 'dark'));
       document.getElementById('statsButton').addEventListener('click', openStats);
       document.getElementById('downloadButton').addEventListener('click', downloadCsv);
@@ -932,15 +965,16 @@
       document.addEventListener('keydown', event => {
         if (event.key === 'Escape' && !resetBackdrop.hidden) closeResetDialog();
         else if (event.key === 'Escape' && !statsBackdrop.hidden) closeStats();
-        else if (event.key === 'Enter' && answered && statsBackdrop.hidden && resetBackdrop.hidden) startQuestion();
+        else if (event.key === 'Enter' && answered && statsBackdrop.hidden && resetBackdrop.hidden) advanceQuestion();
       });
 
       beginSession();
       applyTheme(state.theme);
       configureInput();
       updateStats();
-      const savedQuestion = state.questions.find(question => question.questionId === state.game.currentQuestionId && question.status === 'active');
-      if (savedQuestion) restoreActiveQuestion(savedQuestion);
+      const savedQuestion = state.questions.find(question => question.questionId === state.game.currentQuestionId);
+      if (savedQuestion && savedQuestion.status === 'active') restoreActiveQuestion(savedQuestion);
+      else if (savedQuestion && savedQuestion.status === 'answered' && savedQuestion.acknowledgedAt === null) restoreAnsweredQuestion(savedQuestion);
       else startQuestion();
 
       window.addEventListener('pagehide', () => {
@@ -957,3 +991,8 @@
   </script>
 </body>
 </html>
+
+
+
+
+
