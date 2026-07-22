@@ -234,6 +234,21 @@
       padding: 18px;
     }
 
+    .confirm-backdrop { z-index: 30; }
+
+    .confirm-modal {
+      width: min(420px, 100%);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--bg);
+      color: var(--text);
+      padding: 22px;
+    }
+
+    .confirm-modal h2 { margin: 0 0 8px; font-size: 1.2rem; }
+    .confirm-modal p { margin: 0; color: var(--muted); line-height: 1.5; }
+    .danger-button { color: var(--error); border-color: var(--error); }
+
     .modal-header {
       display: flex;
       align-items: center;
@@ -243,21 +258,7 @@
     }
 
     .modal-header h2 { margin: 0; font-size: 1.2rem; }
-    .modal-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
-
-    .history-wrap {
-      overflow-x: auto;
-      margin-top: 16px;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-    }
-
-    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; font-variant-numeric: tabular-nums; }
-    th, td { padding: 9px 10px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
-    th { color: var(--muted); font-weight: 600; background: var(--accent); }
-    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
-    tbody tr:last-child td { border-bottom: 0; }
-    .empty-history { color: var(--muted); text-align: center; padding: 22px; }
+    .modal-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
 
     @media (max-width: 700px) and (pointer: coarse) {
       .keypad { display: grid; }
@@ -315,20 +316,31 @@
       </header>
       <div class="stats-grid" aria-label="Lifetime statistics">
         <div class="stat-card"><span class="stat-value" id="attemptsStat">0</span><span class="stat-label">answers</span></div>
+        <div class="stat-card"><span class="stat-value" id="correctStat">0</span><span class="stat-label">correct</span></div>
+        <div class="stat-card"><span class="stat-value" id="incorrectStat">0</span><span class="stat-label">incorrect</span></div>
         <div class="stat-card"><span class="stat-value" id="accuracyStat">—</span><span class="stat-label">accuracy</span></div>
-        <div class="stat-card"><span class="stat-value" id="averageStat">—</span><span class="stat-label">average</span></div>
+        <div class="stat-card"><span class="stat-value" id="averageStat">—</span><span class="stat-label">average time</span></div>
+        <div class="stat-card"><span class="stat-value" id="fastestStat">—</span><span class="stat-label">fastest time</span></div>
         <div class="stat-card"><span class="stat-value" id="bestStreakStat">0</span><span class="stat-label">best streak</span></div>
         <div class="stat-card"><span class="stat-value" id="seenStat">0</span><span class="stat-label">patterns seen</span></div>
         <div class="stat-card"><span class="stat-value" id="streakStat">0</span><span class="stat-label">current streak</span></div>
+        <div class="stat-card"><span class="stat-value" id="masteredStat">0</span><span class="stat-label">patterns mastered</span></div>
       </div>
-      <div class="history-wrap" id="historyWrap">
-        <table id="historyTable">
-          <thead><tr><th>Value</th><th>Binary</th><th>Tries</th><th>Accuracy</th><th>Avg.</th><th>Best</th><th>Last</th></tr></thead>
-          <tbody id="historyBody"></tbody>
-        </table>
-        <div class="empty-history" id="emptyHistory">No answers recorded yet.</div>
+      <div class="modal-actions">
+        <button class="text-button" id="downloadButton" type="button">Download complete CSV</button>
+        <button class="text-button" id="resetButton" type="button">Reset all progress</button>
       </div>
-      <div class="modal-actions"><button class="text-button" id="resetButton" type="button">Reset all progress</button></div>
+    </section>
+  </div>
+
+  <div class="modal-backdrop confirm-backdrop" id="resetBackdrop" hidden>
+    <section class="confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="resetTitle" aria-describedby="resetDescription">
+      <h2 id="resetTitle">Reset all progress?</h2>
+      <p id="resetDescription">This permanently deletes the complete question history, timing data, sessions, and summary progress.</p>
+      <div class="modal-actions">
+        <button class="text-button" id="cancelResetButton" type="button">Cancel</button>
+        <button class="text-button danger-button" id="confirmResetButton" type="button">Reset all progress</button>
+      </div>
     </section>
   </div>
 
@@ -336,28 +348,34 @@
     (() => {
       'use strict';
 
-      const STORAGE_KEY = 'binaryDotsTrainer.v1';
-      const emptyPattern = () => ({ attempts: 0, correct: 0, totalMs: 0, bestMs: null, lastMs: null, mistakes: 0 });
+      const STORAGE_KEY = 'binaryDotsTrainer.v2';
+      const LEGACY_STORAGE_KEY = 'binaryDotsTrainer.v1';
       const freshState = () => ({
-        version: 1,
+        version: 2,
         theme: 'light',
-        totalAttempts: 0,
-        totalCorrect: 0,
-        totalCorrectMs: 0,
-        streak: 0,
-        bestStreak: 0,
-        patterns: Array.from({ length: 64 }, emptyPattern),
-        deck: [],
-        review: [],
-        questionsSinceReview: 0,
-        lastValue: null
+        sessions: [],
+        questions: [],
+        nextSequence: 1,
+        game: {
+          deck: [],
+          review: [],
+          questionsSinceReview: 0,
+          lastValue: null,
+          currentQuestionId: null
+        }
       });
+
+      function makeId() {
+        if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') return globalThis.crypto.randomUUID();
+        return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+      }
 
       function loadState() {
         try {
+          localStorage.removeItem(LEGACY_STORAGE_KEY);
           const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-          if (!saved || saved.version !== 1 || !Array.isArray(saved.patterns) || saved.patterns.length !== 64) return freshState();
-          return { ...freshState(), ...saved };
+          if (!saved || saved.version !== 2 || !Array.isArray(saved.sessions) || !Array.isArray(saved.questions)) return freshState();
+          return { ...freshState(), ...saved, game: { ...freshState().game, ...saved.game } };
         } catch (_) {
           return freshState();
         }
@@ -366,8 +384,9 @@
       let state = loadState();
       let currentValue = 0;
       let answer = '';
-      let startedAt = 0;
       let answered = false;
+      let currentQuestion = null;
+      let currentSessionId = null;
 
       const dots = document.getElementById('dots');
       const answerInput = document.getElementById('answerInput');
@@ -378,6 +397,7 @@
       const themeToggle = document.getElementById('themeToggle');
       const themeColor = document.getElementById('themeColor');
       const statsBackdrop = document.getElementById('statsBackdrop');
+      const resetBackdrop = document.getElementById('resetBackdrop');
       const mobileKeypad = window.matchMedia('(max-width: 700px) and (pointer: coarse)');
 
       for (let bit = 5; bit >= 0; bit -= 1) {
@@ -391,6 +411,34 @@
         try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (_) { /* Storage may be unavailable in private mode. */ }
       }
 
+      function beginSession() {
+        const now = Date.now();
+        const session = { sessionId: makeId(), startedAt: now, lastActiveAt: now };
+        state.sessions.push(session);
+        currentSessionId = session.sessionId;
+        saveState();
+      }
+
+      function touchSession() {
+        const session = state.sessions.find(item => item.sessionId === currentSessionId);
+        if (session) session.lastActiveAt = Date.now();
+      }
+
+      function answeredQuestions() {
+        return state.questions.filter(question => question.status === 'answered');
+      }
+
+      function getPatternStats(value) {
+        const attempts = answeredQuestions().filter(question => question.correctAnswer === value);
+        const correct = attempts.filter(question => question.isCorrect);
+        return {
+          attempts: attempts.length,
+          correct: correct.length,
+          mistakes: attempts.length - correct.length,
+          totalCorrectMs: correct.reduce((sum, question) => sum + question.responseMs, 0)
+        };
+      }
+
       function shuffle(values) {
         const copy = values.slice();
         for (let i = copy.length - 1; i > 0; i -= 1) {
@@ -401,22 +449,25 @@
       }
 
       function isMastered(pattern) {
-        return pattern.correct >= 2 && pattern.correct > 0 && pattern.totalMs / pattern.correct <= 3000;
+        return pattern.correct >= 2 && pattern.totalCorrectMs / pattern.correct <= 3000;
       }
 
       function refillDeck() {
         const priority = [];
         const mastered = [];
-        state.patterns.forEach((pattern, value) => (isMastered(pattern) ? mastered : priority).push(value));
-        state.deck = shuffle(priority).concat(shuffle(mastered));
+        for (let value = 0; value < 64; value += 1) {
+          (isMastered(getPatternStats(value)) ? mastered : priority).push(value);
+        }
+        state.game.deck = shuffle(priority).concat(shuffle(mastered));
       }
 
       function weightedChoice() {
-        const candidates = state.patterns.map((pattern, value) => {
-          const average = pattern.correct ? pattern.totalMs / pattern.correct : 6000;
+        const candidates = Array.from({ length: 64 }, (_, value) => {
+          const pattern = getPatternStats(value);
+          const average = pattern.correct ? pattern.totalCorrectMs / pattern.correct : 6000;
           const errorRate = pattern.attempts ? pattern.mistakes / pattern.attempts : 1;
           const weight = 1 + errorRate * 5 + Math.max(0, average - 2500) / 1000 + (pattern.attempts === 0 ? 5 : 0);
-          return { value, weight: value === state.lastValue ? weight * 0.15 : weight };
+          return { value, weight: value === state.game.lastValue ? weight * 0.15 : weight };
         });
         let roll = Math.random() * candidates.reduce((sum, item) => sum + item.weight, 0);
         for (const item of candidates) {
@@ -428,17 +479,24 @@
 
       function chooseNext() {
         let value;
-        if (state.review.length && state.questionsSinceReview >= 2) {
-          value = state.review.shift();
-          state.questionsSinceReview = 0;
+        let source;
+        const previousValue = state.game.lastValue;
+        if (state.game.review.length && state.game.questionsSinceReview >= 2) {
+          value = state.game.review.shift();
+          state.game.questionsSinceReview = 0;
+          source = 'review';
         } else {
-          if (!state.deck.length) refillDeck();
-          value = state.deck.shift();
-          state.questionsSinceReview += 1;
+          if (!state.game.deck.length) refillDeck();
+          value = state.game.deck.shift();
+          state.game.questionsSinceReview += 1;
+          source = 'deck';
         }
-        if (value === state.lastValue) value = weightedChoice();
-        state.lastValue = value;
-        return value;
+        if (value === state.game.lastValue) {
+          value = weightedChoice();
+          source = 'weighted-choice';
+        }
+        state.game.lastValue = value;
+        return { value, source, previousValue };
       }
 
       function renderDots(value) {
@@ -465,7 +523,8 @@
       }
 
       function startQuestion() {
-        currentValue = chooseNext();
+        const selection = chooseNext();
+        currentValue = selection.value;
         answer = '';
         answered = false;
         message.textContent = '';
@@ -476,45 +535,93 @@
         configureInput();
         updateAnswer();
         renderDots(currentValue);
-        startedAt = performance.now();
+        const shownAt = Date.now();
+        const sessionSequence = state.questions.filter(question => question.sessionId === currentSessionId).length + 1;
+        currentQuestion = {
+          questionId: makeId(),
+          sessionId: currentSessionId,
+          answeredSessionId: null,
+          sequence: state.nextSequence,
+          sessionSequence,
+          status: 'active',
+          selectionSource: selection.source,
+          previousValue: selection.previousValue,
+          binaryPattern: currentValue.toString(2).padStart(6, '0'),
+          correctAnswer: currentValue,
+          enteredAnswer: '',
+          isCorrect: null,
+          shownAt,
+          answeredAt: null,
+          responseMs: null,
+          streakBefore: calculateSummary().currentStreak,
+          streakAfter: null,
+          queuedForReview: false,
+          deckAfterSelection: state.game.deck.slice(),
+          reviewAfterSelection: state.game.review.slice(),
+          questionsSinceReviewAfterSelection: state.game.questionsSinceReview,
+          reviewAfterAnswer: null
+        };
+        state.nextSequence += 1;
+        state.questions.push(currentQuestion);
+        state.game.currentQuestionId = currentQuestion.questionId;
+        touchSession();
         saveState();
         if (!mobileKeypad.matches) answerInput.focus({ preventScroll: true });
       }
 
+      function restoreActiveQuestion(question) {
+        currentQuestion = question;
+        currentValue = question.correctAnswer;
+        answer = question.enteredAnswer || '';
+        answered = false;
+        message.textContent = '';
+        message.className = 'message';
+        nextButton.classList.remove('visible');
+        setKeypadDisabled(false);
+        answerInput.disabled = false;
+        configureInput();
+        updateAnswer();
+        renderDots(currentValue);
+        if (!mobileKeypad.matches) answerInput.focus({ preventScroll: true });
+      }
+
       function addReview(value) {
-        if (!state.review.includes(value)) state.review.push(value);
+        if (!state.game.review.includes(value)) state.game.review.push(value);
       }
 
       function submitAnswer() {
-        if (answered || answer === '') return;
-        const elapsed = Math.max(1, Math.round(performance.now() - startedAt));
+        if (answered || answer === '' || !currentQuestion) return;
+        const answeredAt = Date.now();
+        const elapsed = Math.max(1, answeredAt - currentQuestion.shownAt);
         const guess = Number(answer);
         const correct = guess === currentValue;
-        const pattern = state.patterns[currentValue];
 
         answered = true;
-        pattern.attempts += 1;
-        pattern.lastMs = elapsed;
-        state.totalAttempts += 1;
+        currentQuestion.status = 'answered';
+        currentQuestion.answeredSessionId = currentSessionId;
+        currentQuestion.enteredAnswer = answer;
+        currentQuestion.isCorrect = correct;
+        currentQuestion.answeredAt = answeredAt;
+        currentQuestion.responseMs = elapsed;
+        currentQuestion.streakAfter = correct ? currentQuestion.streakBefore + 1 : 0;
 
         if (correct) {
-          pattern.correct += 1;
-          pattern.totalMs += elapsed;
-          pattern.bestMs = pattern.bestMs === null ? elapsed : Math.min(pattern.bestMs, elapsed);
-          state.totalCorrect += 1;
-          state.totalCorrectMs += elapsed;
-          state.streak += 1;
-          state.bestStreak = Math.max(state.bestStreak, state.streak);
           message.textContent = `Correct — ${(elapsed / 1000).toFixed(2)} seconds.`;
           message.className = 'message correct';
-          if (elapsed > 3500) addReview(currentValue);
+          if (elapsed > 3500) {
+            addReview(currentValue);
+            currentQuestion.queuedForReview = true;
+          }
         } else {
-          pattern.mistakes += 1;
-          state.streak = 0;
           message.textContent = `Not quite. The answer is ${currentValue} (${currentValue.toString(2).padStart(6, '0')}).`;
           message.className = 'message incorrect';
           addReview(currentValue);
+          currentQuestion.queuedForReview = true;
         }
+
+        currentQuestion.reviewAfterAnswer = state.game.review.slice();
+        state.game.currentQuestionId = null;
+        touchSession();
 
         setKeypadDisabled(true);
         answerInput.disabled = true;
@@ -524,16 +631,45 @@
         nextButton.focus({ preventScroll: true });
       }
 
+      function calculateSummary() {
+        const attempts = answeredQuestions().sort((a, b) => a.sequence - b.sequence);
+        const correct = attempts.filter(question => question.isCorrect).length;
+        const times = attempts.map(question => question.responseMs);
+        let currentStreak = 0;
+        let bestStreak = 0;
+        attempts.forEach(question => {
+          currentStreak = question.isCorrect ? currentStreak + 1 : 0;
+          bestStreak = Math.max(bestStreak, currentStreak);
+        });
+        let mastered = 0;
+        for (let value = 0; value < 64; value += 1) {
+          if (isMastered(getPatternStats(value))) mastered += 1;
+        }
+        return {
+          attempts: attempts.length,
+          correct,
+          incorrect: attempts.length - correct,
+          averageMs: times.length ? times.reduce((sum, time) => sum + time, 0) / times.length : null,
+          fastestMs: times.length ? Math.min(...times) : null,
+          patternsSeen: new Set(attempts.map(question => question.correctAnswer)).size,
+          currentStreak,
+          bestStreak,
+          mastered
+        };
+      }
+
       function updateStats() {
-        const accuracy = state.totalAttempts ? `${Math.round(state.totalCorrect / state.totalAttempts * 100)}%` : '—';
-        const average = state.totalCorrect ? `${(state.totalCorrectMs / state.totalCorrect / 1000).toFixed(1)}s` : '—';
-        const seen = state.patterns.filter(pattern => pattern.attempts > 0).length;
-        document.getElementById('accuracyStat').textContent = accuracy;
-        document.getElementById('averageStat').textContent = average;
-        document.getElementById('attemptsStat').textContent = String(state.totalAttempts);
-        document.getElementById('bestStreakStat').textContent = String(state.bestStreak);
-        document.getElementById('seenStat').textContent = String(seen);
-        document.getElementById('streakStat').textContent = String(state.streak);
+        const summary = calculateSummary();
+        document.getElementById('attemptsStat').textContent = String(summary.attempts);
+        document.getElementById('correctStat').textContent = String(summary.correct);
+        document.getElementById('incorrectStat').textContent = String(summary.incorrect);
+        document.getElementById('accuracyStat').textContent = summary.attempts ? `${Math.round(summary.correct / summary.attempts * 100)}%` : '—';
+        document.getElementById('averageStat').textContent = formatTime(summary.averageMs);
+        document.getElementById('fastestStat').textContent = formatTime(summary.fastestMs);
+        document.getElementById('bestStreakStat').textContent = String(summary.bestStreak);
+        document.getElementById('seenStat').textContent = String(summary.patternsSeen);
+        document.getElementById('streakStat').textContent = String(summary.currentStreak);
+        document.getElementById('masteredStat').textContent = String(summary.mastered);
       }
 
       function enterDigit(digit) {
@@ -542,6 +678,14 @@
         if (Number(proposed) > 63) return;
         answer = proposed;
         updateAnswer();
+        saveDraft();
+      }
+
+      function saveDraft() {
+        if (!currentQuestion || currentQuestion.status !== 'active') return;
+        currentQuestion.enteredAnswer = answer;
+        touchSession();
+        saveState();
       }
 
       function applyTheme(theme) {
@@ -558,39 +702,83 @@
         return ms === null || ms === undefined ? '—' : `${(ms / 1000).toFixed(2)}s`;
       }
 
-      function renderHistory() {
-        updateStats();
-        const rows = state.patterns
-          .map((pattern, value) => ({ pattern, value }))
-          .filter(item => item.pattern.attempts > 0);
-        const body = document.getElementById('historyBody');
-        body.replaceChildren();
-        document.getElementById('historyTable').hidden = rows.length === 0;
-        document.getElementById('emptyHistory').hidden = rows.length > 0;
-        rows.forEach(({ pattern, value }) => {
-          const row = document.createElement('tr');
-          const accuracy = Math.round(pattern.correct / pattern.attempts * 100);
-          const average = pattern.correct ? pattern.totalMs / pattern.correct : null;
-          [
-            String(value),
-            value.toString(2).padStart(6, '0'),
-            String(pattern.attempts),
-            `${accuracy}%`,
-            formatTime(average),
-            formatTime(pattern.bestMs),
-            formatTime(pattern.lastMs)
-          ].forEach(text => {
-            const cell = document.createElement('td');
-            cell.textContent = text;
-            row.appendChild(cell);
-          });
-          body.appendChild(row);
-        });
+      function toIso(timestamp) {
+        return timestamp === null || timestamp === undefined ? '' : new Date(timestamp).toISOString();
+      }
+
+      function csvCell(value) {
+        if (value === null || value === undefined) return '';
+        const text = typeof value === 'string' ? value : String(value);
+        return `"${text.replace(/"/g, '""')}"`;
+      }
+
+      function downloadCsv() {
+        touchSession();
+        saveState();
+        const exportedAt = Date.now();
+        const columns = [
+          'record_type', 'schema_version', 'exported_at_utc', 'theme',
+          'session_id', 'answered_session_id', 'session_started_at_utc', 'session_last_active_at_utc',
+          'question_id', 'global_sequence', 'session_sequence', 'status', 'selection_source',
+          'previous_value', 'binary_pattern', 'correct_answer', 'entered_answer', 'is_correct',
+          'shown_at_utc', 'answered_at_utc', 'response_ms', 'streak_before', 'streak_after',
+          'queued_for_review', 'deck_after_selection', 'review_after_selection',
+          'questions_since_review_after_selection', 'review_after_answer',
+          'current_question_id', 'current_deck', 'current_review',
+          'current_questions_since_review', 'current_last_value'
+        ];
+        const rows = [];
+        const metadata = {
+          record_type: 'metadata', schema_version: state.version, exported_at_utc: toIso(exportedAt), theme: state.theme,
+          current_question_id: state.game.currentQuestionId,
+          current_deck: JSON.stringify(state.game.deck),
+          current_review: JSON.stringify(state.game.review),
+          current_questions_since_review: state.game.questionsSinceReview,
+          current_last_value: state.game.lastValue
+        };
+        rows.push(metadata);
+        state.sessions.forEach(session => rows.push({
+          record_type: 'session', schema_version: state.version, exported_at_utc: toIso(exportedAt),
+          session_id: session.sessionId,
+          session_started_at_utc: toIso(session.startedAt),
+          session_last_active_at_utc: toIso(session.lastActiveAt)
+        }));
+        state.questions.forEach(question => rows.push({
+          record_type: 'question', schema_version: state.version, exported_at_utc: toIso(exportedAt),
+          session_id: question.sessionId, answered_session_id: question.answeredSessionId,
+          question_id: question.questionId,
+          global_sequence: question.sequence, session_sequence: question.sessionSequence,
+          status: question.status, selection_source: question.selectionSource,
+          previous_value: question.previousValue, binary_pattern: question.binaryPattern,
+          correct_answer: question.correctAnswer, entered_answer: question.enteredAnswer,
+          is_correct: question.isCorrect, shown_at_utc: toIso(question.shownAt),
+          answered_at_utc: toIso(question.answeredAt), response_ms: question.responseMs,
+          streak_before: question.streakBefore, streak_after: question.streakAfter,
+          queued_for_review: question.queuedForReview,
+          deck_after_selection: JSON.stringify(question.deckAfterSelection),
+          review_after_selection: JSON.stringify(question.reviewAfterSelection),
+          questions_since_review_after_selection: question.questionsSinceReviewAfterSelection,
+          review_after_answer: question.reviewAfterAnswer === null ? '' : JSON.stringify(question.reviewAfterAnswer)
+        }));
+        const csv = [columns.map(csvCell).join(','), ...rows.map(row => columns.map(column => csvCell(row[column])).join(','))].join('\r\n');
+        const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `binary-dots-progress-${new Date().toISOString().slice(0, 10)}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
       }
 
       function openStats() {
-        renderHistory();
         statsBackdrop.hidden = false;
+        try {
+          updateStats();
+        } catch (error) {
+          console.error('Unable to calculate saved statistics.', error);
+        }
         document.getElementById('closeStatsButton').focus();
       }
 
@@ -599,24 +787,62 @@
         document.getElementById('statsButton').focus();
       }
 
+      function openResetDialog() {
+        resetBackdrop.hidden = false;
+        statsBackdrop.setAttribute('aria-hidden', 'true');
+        document.getElementById('cancelResetButton').focus();
+      }
+
+      function closeResetDialog() {
+        resetBackdrop.hidden = true;
+        statsBackdrop.removeAttribute('aria-hidden');
+        document.getElementById('resetButton').focus();
+      }
+
+      function resetProgress() {
+        const theme = state.theme;
+        state = freshState();
+        state.theme = theme;
+        currentQuestion = null;
+        answer = '';
+        answered = false;
+        beginSession();
+        updateStats();
+        startQuestion();
+        closeResetDialog();
+      }
+
       keypad.addEventListener('click', event => {
         const button = event.target.closest('button');
         if (!button) return;
         if (button.dataset.digit !== undefined) enterDigit(button.dataset.digit);
       });
-      document.getElementById('clearButton').addEventListener('click', () => { if (!answered) { answer = ''; updateAnswer(); } });
+      document.getElementById('clearButton').addEventListener('click', () => {
+        if (!answered) {
+          answer = '';
+          updateAnswer();
+          saveDraft();
+        }
+      });
       document.getElementById('submitButton').addEventListener('click', submitAnswer);
       nextButton.addEventListener('click', startQuestion);
       themeToggle.addEventListener('click', () => applyTheme(state.theme === 'dark' ? 'light' : 'dark'));
       document.getElementById('statsButton').addEventListener('click', openStats);
+      document.getElementById('downloadButton').addEventListener('click', downloadCsv);
       document.getElementById('closeStatsButton').addEventListener('click', closeStats);
       statsBackdrop.addEventListener('click', event => { if (event.target === statsBackdrop) closeStats(); });
-      mobileKeypad.addEventListener('change', configureInput);
+      document.getElementById('resetButton').addEventListener('click', openResetDialog);
+      document.getElementById('cancelResetButton').addEventListener('click', closeResetDialog);
+      document.getElementById('confirmResetButton').addEventListener('click', resetProgress);
+      resetBackdrop.addEventListener('click', event => { if (event.target === resetBackdrop) closeResetDialog(); });
+      if (typeof mobileKeypad.addEventListener === 'function') mobileKeypad.addEventListener('change', configureInput);
+      else if (typeof mobileKeypad.addListener === 'function') mobileKeypad.addListener(configureInput);
 
       answerInput.addEventListener('input', () => {
         const cleaned = answerInput.value.replace(/\D/g, '').slice(0, 2);
-        answer = cleaned && Number(cleaned) <= 63 ? cleaned : answer;
+        answer = cleaned === '' || Number(cleaned) <= 63 ? cleaned : answer;
         updateAnswer();
+        saveDraft();
       });
       answerForm.addEventListener('submit', event => {
         event.preventDefault();
@@ -624,25 +850,29 @@
       });
 
       document.addEventListener('keydown', event => {
-        if (event.key === 'Escape' && !statsBackdrop.hidden) closeStats();
-        else if (event.key === 'Enter' && answered && statsBackdrop.hidden) startQuestion();
+        if (event.key === 'Escape' && !resetBackdrop.hidden) closeResetDialog();
+        else if (event.key === 'Escape' && !statsBackdrop.hidden) closeStats();
+        else if (event.key === 'Enter' && answered && statsBackdrop.hidden && resetBackdrop.hidden) startQuestion();
       });
 
-      document.getElementById('resetButton').addEventListener('click', () => {
-        if (!confirm('Delete all saved attempts, times, and mastery progress?')) return;
-        const theme = state.theme;
-        state = freshState();
-        state.theme = theme;
-        saveState();
-        updateStats();
-        renderHistory();
-        startQuestion();
-      });
-
+      beginSession();
       applyTheme(state.theme);
       configureInput();
       updateStats();
-      startQuestion();
+      const savedQuestion = state.questions.find(question => question.questionId === state.game.currentQuestionId && question.status === 'active');
+      if (savedQuestion) restoreActiveQuestion(savedQuestion);
+      else startQuestion();
+
+      window.addEventListener('pagehide', () => {
+        touchSession();
+        saveState();
+      });
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+          touchSession();
+          saveState();
+        }
+      });
     })();
   </script>
 </body>
